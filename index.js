@@ -4,6 +4,7 @@ const BbPromise = require("bluebird");
 const AWS = require("aws-sdk");
 const dynamodbLocal = require("dynamodb-localhost");
 const seeder = require("./src/seeder");
+const path = require('path');
 
 class ServerlessDynamodbLocal {
     constructor(serverless, options) {
@@ -11,7 +12,11 @@ class ServerlessDynamodbLocal {
         this.service = serverless.service;
         this.serverlessLog = serverless.cli.log.bind(serverless.cli);
         this.config = this.service.custom && this.service.custom.dynamodb || {};
-        this.options = options;
+        this.options = _.merge({
+          localPath: serverless.config && path.join(serverless.config.servicePath, '.dynamodb')
+          },
+          options
+        );
         this.provider = "aws";
         this.commands = {
             dynamodb: {
@@ -69,6 +74,20 @@ class ServerlessDynamodbLocal {
                             seed: {
                                 shortcut: "s",
                                 usage: "After starting and migrating dynamodb local, injects seed data into your tables. The --seed option determines which data categories to onload.",
+                            },
+                            migration: {
+                                shortcut: 'm',
+                                usage: 'After starting dynamodb local, run dynamodb migrations'
+                            },
+                            heapInitial: {
+                                usage: 'The initial heap size. Specify megabytes, gigabytes or terabytes using m, b, t. E.g., "2m"'
+                            },
+                            heapMax: {
+                                usage: 'The maximum heap size. Specify megabytes, gigabytes or terabytes using m, b, t. E.g., "2m"'
+                            },
+                            convertEmptyValues: {
+                                shortcut: "e",
+                                usage: "Set to true if you would like the document client to convert empty values (0-length strings, binary buffers, and sets) to be converted to NULL types when persisting to DynamoDB.",
                             }
                         }
                     },
@@ -96,6 +115,13 @@ class ServerlessDynamodbLocal {
             }
         };
 
+        const stage = (this.options && this.options.stage) || (this.service.provider && this.service.provider.stage);
+        if (this.config.stages && !this.config.stages.includes(stage)) {
+          // don't do anything for this stage
+          this.hooks = {};
+          return;
+        }
+
         this.hooks = {
             "dynamodb:migrate:migrateHandler": this.migrateHandler.bind(this),
             "dynamodb:seed:seedHandler": this.seedHandler.bind(this),
@@ -108,13 +134,13 @@ class ServerlessDynamodbLocal {
     }
 
     get port() {
-        const config = this.config;
+        const config = this.service.custom && this.service.custom.dynamodb || {};
         const port = _.get(config, "start.port", 8000);
         return port;
     }
 
     get host() {
-        const config = this.config;
+        const config = this.service.custom && this.service.custom.dynamodb || {};
         const host = _.get(config, "start.host", "localhost");
         return host;
     }
@@ -124,18 +150,20 @@ class ServerlessDynamodbLocal {
 
         if(options && options.online){
             this.serverlessLog("Connecting to online tables...");
-            if (!options.region) { 
+            if (!options.region) {
                 throw new Error("please specify the region");
             }
             dynamoOptions = {
                 region: options.region,
+                convertEmptyValues: options && options.convertEmptyValues ? options.convertEmptyValues : false,
             };
         } else {
             dynamoOptions = {
                 endpoint: `http://${this.host}:${this.port}`,
                 region: "localhost",
                 accessKeyId: "MOCK_ACCESS_KEY_ID",
-                secretAccessKey: "MOCK_SECRET_ACCESS_KEY"
+                secretAccessKey: "MOCK_SECRET_ACCESS_KEY",
+                convertEmptyValues: options && options.convertEmptyValues ? options.convertEmptyValues : false,
             };
         }
 
@@ -152,7 +180,7 @@ class ServerlessDynamodbLocal {
     }
 
     seedHandler() {
-        const options = this.options; 
+        const options = this.options;
         const dynamodb = this.dynamodbOptions(options);
 
         return BbPromise.each(this.seedSources, (source) => {
@@ -177,9 +205,10 @@ class ServerlessDynamodbLocal {
     }
 
     startHandler() {
-        const config = this.config;
+        const config = this.service.custom && this.service.custom.dynamodb || {};
         const options = _.merge({
-                sharedDb: this.options.sharedDb || true
+                sharedDb: this.options.sharedDb || true,
+                install_path: this.options.localPath
             },
             config && config.start,
             this.options
@@ -187,6 +216,12 @@ class ServerlessDynamodbLocal {
 
         // otherwise endHandler will be mis-informed
         this.options = options;
+
+        let dbPath = options.dbPath;
+        if (dbPath) {
+          options.dbPath = path.isAbsolute(dbPath) ? dbPath : path.join(this.serverless.config.servicePath, dbPath);
+        }
+
         if (!options.noStart) {
           dynamodbLocal.start(options);
         }
@@ -273,14 +308,26 @@ class ServerlessDynamodbLocal {
               migration.SSESpecification.Enabled = migration.SSESpecification.SSEEnabled;
               delete migration.SSESpecification.SSEEnabled;
             }
-            
+            if (migration.PointInTimeRecoverySpecification) {
+              delete migration.PointInTimeRecoverySpecification;
+            }
             if (migration.Tags) {
                 delete migration.Tags;
             }
+            if (migration.BillingMode === "PAY_PER_REQUEST") {
+                delete migration.BillingMode;
 
-            if (migration.PointInTimeRecoverySpecification) {
-                delete migration.PointInTimeRecoverySpecification;
-            }
+                const defaultProvisioning = {
+                    ReadCapacityUnits: 5,
+                    WriteCapacityUnits: 5
+                };
+                migration.ProvisionedThroughput = defaultProvisioning;
+                if (migration.GlobalSecondaryIndexes) {
+                    migration.GlobalSecondaryIndexes.forEach((gsi) => {
+                        gsi.ProvisionedThroughput = defaultProvisioning;
+                    });
+                }
+              }
             dynamodb.raw.createTable(migration, (err) => {
                 if (err) {
                     if (err.name === 'ResourceInUseException') {
